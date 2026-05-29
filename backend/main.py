@@ -6,10 +6,12 @@ Author: Built for Desmond Onam's CV/LinkedIn revamp lead generation service
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import anthropic
+from groq import Groq
 import requests
 from bs4 import BeautifulSoup
 import sqlite3
+import psycopg2
+import psycopg2.extras
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -34,48 +36,85 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 # ─── Database ─────────────────────────────────────────────────────────────────
 
+DATABASE_URL = os.getenv("DATABASE_URL")  # set in production; absent = use SQLite
+
+def get_conn():
+    if DATABASE_URL:
+        return psycopg2.connect(DATABASE_URL, sslmode="require"), "pg"
+    return sqlite3.connect("leads.db"), "sqlite"
+
 def init_db():
-    conn = sqlite3.connect("leads.db")
+    conn, mode = get_conn()
     c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS leads (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            name          TEXT,
-            email         TEXT UNIQUE,
-            phone         TEXT,
-            linkedin_url  TEXT,
-            portfolio_url TEXT,
-            overall_score REAL,
-            cv_grade      TEXT,
-            needs_revamp  BOOLEAN,
-            scores_json   TEXT,
-            analysis_json TEXT,
-            contacted     BOOLEAN DEFAULT 0,
-            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
+    if mode == "pg":
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS leads (
+                id            SERIAL PRIMARY KEY,
+                name          TEXT,
+                email         TEXT UNIQUE,
+                phone         TEXT,
+                linkedin_url  TEXT,
+                portfolio_url TEXT,
+                overall_score REAL,
+                cv_grade      TEXT,
+                needs_revamp  BOOLEAN,
+                scores_json   TEXT,
+                analysis_json TEXT,
+                contacted     BOOLEAN DEFAULT FALSE,
+                created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+    else:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS leads (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                name          TEXT,
+                email         TEXT UNIQUE,
+                phone         TEXT,
+                linkedin_url  TEXT,
+                portfolio_url TEXT,
+                overall_score REAL,
+                cv_grade      TEXT,
+                needs_revamp  BOOLEAN,
+                scores_json   TEXT,
+                analysis_json TEXT,
+                contacted     BOOLEAN DEFAULT 0,
+                created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
     conn.commit()
     conn.close()
 
 init_db()
 
 def save_lead(name, email, phone, linkedin_url, portfolio_url, overall_score, cv_grade, needs_revamp, scores, analysis):
-    conn = sqlite3.connect("leads.db")
+    conn, mode = get_conn()
     c = conn.cursor()
     try:
-        c.execute("""
-            INSERT OR REPLACE INTO leads
-            (name, email, phone, linkedin_url, portfolio_url, overall_score, cv_grade, needs_revamp, scores_json, analysis_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            name, email, phone, linkedin_url, portfolio_url,
-            overall_score, cv_grade, needs_revamp,
-            json.dumps(scores), json.dumps(analysis)
-        ))
+        if mode == "pg":
+            c.execute("""
+                INSERT INTO leads
+                (name, email, phone, linkedin_url, portfolio_url, overall_score, cv_grade, needs_revamp, scores_json, analysis_json)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (email) DO UPDATE SET
+                    name=EXCLUDED.name, overall_score=EXCLUDED.overall_score,
+                    cv_grade=EXCLUDED.cv_grade, needs_revamp=EXCLUDED.needs_revamp,
+                    scores_json=EXCLUDED.scores_json, analysis_json=EXCLUDED.analysis_json
+            """, (name, email, phone, linkedin_url, portfolio_url,
+                  overall_score, cv_grade, needs_revamp,
+                  json.dumps(scores), json.dumps(analysis)))
+        else:
+            c.execute("""
+                INSERT OR REPLACE INTO leads
+                (name, email, phone, linkedin_url, portfolio_url, overall_score, cv_grade, needs_revamp, scores_json, analysis_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (name, email, phone, linkedin_url, portfolio_url,
+                  overall_score, cv_grade, needs_revamp,
+                  json.dumps(scores), json.dumps(analysis)))
         conn.commit()
     except Exception as e:
         print(f"[DB ERROR] {e}")
@@ -155,25 +194,8 @@ ANALYSIS_PROMPT = """
 You are a senior tech career strategist and recruiter with 15+ years placing African tech professionals
 into US and European companies. You do brutally honest, data-driven career profile assessments.
 
-Analyze the following person's career profile completely and return ONLY a valid JSON object —
+Analyze the person's career profile data provided by the user and return ONLY a valid JSON object —
 no markdown fences, no explanation outside the JSON.
-
-== PROFILE DATA ==
-Name: {name}
-LinkedIn: {linkedin_url}
-Portfolio: {portfolio_url}
-
-== CV / RESUME CONTENT ==
-{cv_text}
-
-== LINKEDIN PAGE CONTENT (scraped) ==
-{linkedin_content}
-
-== PORTFOLIO WEBSITE CONTENT (scraped) ==
-{portfolio_content}
-
-== WEB SEARCH RESULTS ==
-{web_results}
 
 == INSTRUCTIONS ==
 Score each category 1–10. Be specific and honest. Base scores on available evidence.
@@ -300,23 +322,26 @@ Be direct. Sugarcoating helps no one.
 """
 
 def run_analysis(name, email, linkedin_url, portfolio_url, cv_text, web_results, linkedin_content, portfolio_content):
-    prompt = ANALYSIS_PROMPT.format(
-        name=name,
-        linkedin_url=linkedin_url or "Not provided",
-        portfolio_url=portfolio_url or "Not provided",
-        cv_text=cv_text or "No CV uploaded",
-        linkedin_content=linkedin_content or "Could not scrape LinkedIn",
-        portfolio_content=portfolio_content or "No portfolio content",
-        web_results=web_results or "No search results",
+    user_data = (
+        f"Name: {name}\n"
+        f"LinkedIn: {linkedin_url or 'Not provided'}\n"
+        f"Portfolio: {portfolio_url or 'Not provided'}\n\n"
+        f"== CV / RESUME CONTENT ==\n{cv_text or 'No CV uploaded'}\n\n"
+        f"== LINKEDIN PAGE CONTENT (scraped) ==\n{linkedin_content or 'Could not scrape LinkedIn'}\n\n"
+        f"== PORTFOLIO WEBSITE CONTENT (scraped) ==\n{portfolio_content or 'No portfolio content'}\n\n"
+        f"== WEB SEARCH RESULTS ==\n{web_results or 'No search results'}"
     )
 
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=4096,
-        messages=[{"role": "user", "content": prompt}]
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        max_tokens=2048,
+        messages=[
+            {"role": "system", "content": ANALYSIS_PROMPT},
+            {"role": "user", "content": user_data},
+        ]
     )
 
-    raw = response.content[0].text.strip()
+    raw = response.choices[0].message.content.strip()
     raw = re.sub(r"^```json\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
     return json.loads(raw)
@@ -594,9 +619,9 @@ def send_email(name: str, to_email: str, analysis: dict):
             server.starttls()
             server.login(smtp_user, smtp_pass)
             server.sendmail(smtp_user, to_email, msg.as_string())
-        print(f"[EMAIL] ✅ Sent to {to_email}")
+        print(f"[EMAIL] OK - Sent to {to_email}")
     except Exception as e:
-        print(f"[EMAIL] ❌ Failed: {e}")
+        print(f"[EMAIL] FAILED: {e}")
 
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
@@ -658,7 +683,7 @@ def get_leads(secret: str = ""):
     """Admin endpoint — view all captured leads."""
     if secret != os.getenv("ADMIN_SECRET", "changeme123"):
         raise HTTPException(status_code=403, detail="Unauthorized")
-    conn = sqlite3.connect("leads.db")
+    conn, mode = get_conn()
     c = conn.cursor()
     c.execute("""
         SELECT id, name, email, phone, linkedin_url, overall_score,
@@ -677,8 +702,9 @@ def mark_contacted(lead_id: int, secret: str = ""):
     """Mark a lead as contacted."""
     if secret != os.getenv("ADMIN_SECRET", "changeme123"):
         raise HTTPException(status_code=403, detail="Unauthorized")
-    conn = sqlite3.connect("leads.db")
-    conn.execute("UPDATE leads SET contacted=1 WHERE id=?", (lead_id,))
+    conn, mode = get_conn()
+    ph = "%s" if mode == "pg" else "?"
+    conn.execute(f"UPDATE leads SET contacted=1 WHERE id={ph}", (lead_id,))
     conn.commit()
     conn.close()
     return {"success": True}

@@ -1,5 +1,55 @@
-.venv
-.venv/
-venv
+# ── Python virtual environments ────────────────────────────────
 venv/
+.venv/
+env/
+.env_dir/
 
+# ── Environment / Secrets (NEVER commit these) ─────────────────
+.env
+.env.local
+.env.production
+.env.staging
+
+# ── Database (private leads data) ──────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+
+# ── Python cache & build artifacts ─────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ── Frontend dependencies & build output ───────────────────────
+node_modules/
+frontend/dist/
+frontend/build/
+
+# ── OS generated files ─────────────────────────────────────────
+.DS_Store
+.DS_Store?
+Thumbs.db
+desktop.ini
+ehthumbs.db
+
+# ── Editor files ───────────────────────────────────────────────
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+*.suo
+
+# ── Logs ───────────────────────────────────────────────────────
+*.log
+logs/
